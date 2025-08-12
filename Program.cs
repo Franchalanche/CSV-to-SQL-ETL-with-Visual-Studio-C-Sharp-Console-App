@@ -92,17 +92,15 @@ namespace ChewyEligibilityArchiver
 
         static long ProcessFile(string path)
         {
-            // 1) Detect encoding (BOM-aware) and delimiter from header
             var enc = DetectEncoding(path);
             var (delimiter, header) = DetectDelimiterAndHeader(path, enc);
             if (string.IsNullOrWhiteSpace(header))
                 throw new InvalidDataException("Empty or unreadable header.");
 
-            // 2) Prepare DataTable and SqlBulkCopy
-            using var conn = new SqlConnection(ConnectionString);
+            using var conn = new Microsoft.Data.SqlClient.SqlConnection(ConnectionString);
             conn.Open();
 
-            using var bulk = new SqlBulkCopy(conn,
+            using var bulk = new Microsoft.Data.SqlClient.SqlBulkCopy(conn,
                 SqlBulkCopyOptions.TableLock | SqlBulkCopyOptions.CheckConstraints | SqlBulkCopyOptions.FireTriggers,
                 null)
             {
@@ -114,10 +112,13 @@ namespace ChewyEligibilityArchiver
             var table = BuildDataTable();
             foreach (DataColumn col in table.Columns)
                 bulk.ColumnMappings.Add(col.ColumnName, col.ColumnName);
-            bulk.SqlRowsCopied += (_, e) => Console.WriteLine($"   {Path.GetFileName(path)}: {e.RowsCopied:N0} rows copied...");
+            bulk.SqlRowsCopied += (_, e) =>
+                Console.WriteLine($"   {Path.GetFileName(path)}: {e.RowsCopied:N0} rows copied...");
 
-            // 3) Configure CsvHelper
-            using var reader = new StreamReader(path, enc, detectEncodingFromByteOrderMarks: true);
+            // --- Open with read-sharing to avoid "being used by another process"
+            using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+            using var reader = new StreamReader(fs, enc, detectEncodingFromByteOrderMarks: true);
+
             var cfg = new CsvConfiguration(CultureInfo.InvariantCulture)
             {
                 Delimiter = delimiter,
@@ -127,23 +128,25 @@ namespace ChewyEligibilityArchiver
                 IgnoreBlankLines = true,
                 TrimOptions = TrimOptions.Trim
             };
-
             using var csv = new CsvReader(reader, cfg);
 
-            // Read header
             if (!csv.Read() || !csv.ReadHeader())
                 throw new InvalidDataException("No header row present.");
 
             var origHeaders = csv.HeaderRecord ?? Array.Empty<string>();
             var indexMap = BuildHeaderMap(origHeaders);
 
-            // 4) Stream rows → DataTable → SqlBulkCopy
+            // Compute once per file
+            var reportDate = GetReportDateFromPath(path);
+            var sourceFileName = Path.GetFileName(path);
+
             long rows = 0;
+
             while (csv.Read())
             {
-                var reportDate = GetReportDateFromPath(path);  // <-- compute once
                 var row = table.NewRow();
 
+                // Fill canonical fields
                 foreach (var col in Canonical)
                 {
                     if (col.Equals("COMPANY_IDENTIFIER", StringComparison.OrdinalIgnoreCase))
@@ -152,9 +155,6 @@ namespace ChewyEligibilityArchiver
                         continue;
                     }
 
-                    row["ReportDate"] = reportDate.HasValue ? reportDate.Value : (object)DBNull.Value;  // <-- NEW
-                    row["SourceFile"] = Path.GetFileName(path);
-
                     if (indexMap.TryGetValue(col, out var idx) && idx >= 0)
                     {
                         var value = csv.GetField(idx);
@@ -162,12 +162,16 @@ namespace ChewyEligibilityArchiver
                     }
                     else
                     {
-                        // Old files missing BUSINESS UNIT → NULL
-                        row[col] = DBNull.Value;
+                        row[col] = DBNull.Value; // e.g., BUSINESS UNIT on old files
                     }
-
                 }
 
+                // Set per-row metadata
+                row["ReportDate"] = reportDate.HasValue ? reportDate.Value : (object)DBNull.Value;
+                row["SourceFile"] = sourceFileName;
+
+                // *** THIS WAS MISSING ***
+                table.Rows.Add(row);
 
                 rows++;
 
@@ -186,6 +190,7 @@ namespace ChewyEligibilityArchiver
 
             return rows;
         }
+
 
         static (string Delimiter, string Header) DetectDelimiterAndHeader(string path, Encoding enc)
         {
