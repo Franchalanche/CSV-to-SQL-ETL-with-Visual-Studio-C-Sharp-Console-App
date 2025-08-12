@@ -1,0 +1,22 @@
+﻿# OS
+Thumbs.db
+Desktop.ini
+
+# Visual Studio / IDE
+.vs/
+.vscode/
+*.vsidx
+*.vssscc
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+
+# Build outputs
+bin/
+obj/
+[Bb]uild/
+Debug/
+Release/
+x64/
+x86/
