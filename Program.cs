@@ -141,6 +141,7 @@ namespace ChewyEligibilityArchiver
             long rows = 0;
             while (csv.Read())
             {
+                var reportDate = GetReportDateFromPath(path);  // <-- compute once
                 var row = table.NewRow();
 
                 foreach (var col in Canonical)
@@ -150,6 +151,9 @@ namespace ChewyEligibilityArchiver
                         row[col] = "Chewy";
                         continue;
                     }
+
+                    row["ReportDate"] = reportDate.HasValue ? reportDate.Value : (object)DBNull.Value;  // <-- NEW
+                    row["SourceFile"] = Path.GetFileName(path);
 
                     if (indexMap.TryGetValue(col, out var idx) && idx >= 0)
                     {
@@ -161,10 +165,10 @@ namespace ChewyEligibilityArchiver
                         // Old files missing BUSINESS UNIT → NULL
                         row[col] = DBNull.Value;
                     }
+
                 }
 
-                row["SourceFile"] = Path.GetFileName(path);
-                table.Rows.Add(row);
+
                 rows++;
 
                 if (table.Rows.Count >= BatchSize)
@@ -190,6 +194,34 @@ namespace ChewyEligibilityArchiver
             var delimiter = first.Contains('\t') ? "\t" : ",";
             return (delimiter, first);
         }
+        static DateTime? GetReportDateFromPath(string path)
+        {
+            // Look for 8 consecutive digits near the end: yyyyMMdd
+            // Examples: ChewyWIN_20230403.csv, TEST_ChewyWIN_20240828.txt, ChewyWIN_20250811_v2.csv
+            var file = Path.GetFileName(path);
+            var span = file.AsSpan();
+
+            // Walk backwards to find the last 8-digit run
+            for (int i = span.Length - 1; i >= 7; i--)
+            {
+                // quick check for 8 digits ending at i (exclusive of extension)
+                if (!char.IsDigit(span[i - 0]) ||
+                    !char.IsDigit(span[i - 1]) ||
+                    !char.IsDigit(span[i - 2]) ||
+                    !char.IsDigit(span[i - 3]) ||
+                    !char.IsDigit(span[i - 4]) ||
+                    !char.IsDigit(span[i - 5]) ||
+                    !char.IsDigit(span[i - 6]) ||
+                    !char.IsDigit(span[i - 7]))
+                    continue;
+
+                var slice = span.Slice(i - 7, 8);
+                if (DateTime.TryParseExact(slice, "yyyyMMdd", System.Globalization.CultureInfo.InvariantCulture,
+                                           System.Globalization.DateTimeStyles.None, out var dt))
+                    return dt;
+            }
+            return null; // couldn’t parse
+        }
 
         static Encoding DetectEncoding(string path)
         {
@@ -210,9 +242,11 @@ namespace ChewyEligibilityArchiver
         {
             var dt = new DataTable();
             foreach (var c in Canonical) dt.Columns.Add(c, typeof(string));
+            dt.Columns.Add("ReportDate", typeof(DateTime));  // <-- NEW
             dt.Columns.Add("SourceFile", typeof(string));
             return dt;
         }
+
 
         static Dictionary<string, int> BuildHeaderMap(string[] headersRaw)
         {
