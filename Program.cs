@@ -92,17 +92,15 @@ namespace ChewyEligibilityArchiver
 
         static long ProcessFile(string path)
         {
-            // 1) Detect encoding (BOM-aware) and delimiter from header
             var enc = DetectEncoding(path);
             var (delimiter, header) = DetectDelimiterAndHeader(path, enc);
             if (string.IsNullOrWhiteSpace(header))
                 throw new InvalidDataException("Empty or unreadable header.");
 
-            // 2) Prepare DataTable and SqlBulkCopy
-            using var conn = new SqlConnection(ConnectionString);
+            using var conn = new Microsoft.Data.SqlClient.SqlConnection(ConnectionString);
             conn.Open();
 
-            using var bulk = new SqlBulkCopy(conn,
+            using var bulk = new Microsoft.Data.SqlClient.SqlBulkCopy(conn,
                 SqlBulkCopyOptions.TableLock | SqlBulkCopyOptions.CheckConstraints | SqlBulkCopyOptions.FireTriggers,
                 null)
             {
@@ -114,10 +112,13 @@ namespace ChewyEligibilityArchiver
             var table = BuildDataTable();
             foreach (DataColumn col in table.Columns)
                 bulk.ColumnMappings.Add(col.ColumnName, col.ColumnName);
-            bulk.SqlRowsCopied += (_, e) => Console.WriteLine($"   {Path.GetFileName(path)}: {e.RowsCopied:N0} rows copied...");
+            bulk.SqlRowsCopied += (_, e) =>
+                Console.WriteLine($"   {Path.GetFileName(path)}: {e.RowsCopied:N0} rows copied...");
 
-            // 3) Configure CsvHelper
-            using var reader = new StreamReader(path, enc, detectEncodingFromByteOrderMarks: true);
+            // --- Open with read-sharing to avoid "being used by another process"
+            using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+            using var reader = new StreamReader(fs, enc, detectEncodingFromByteOrderMarks: true);
+
             var cfg = new CsvConfiguration(CultureInfo.InvariantCulture)
             {
                 Delimiter = delimiter,
@@ -127,22 +128,25 @@ namespace ChewyEligibilityArchiver
                 IgnoreBlankLines = true,
                 TrimOptions = TrimOptions.Trim
             };
-
             using var csv = new CsvReader(reader, cfg);
 
-            // Read header
             if (!csv.Read() || !csv.ReadHeader())
                 throw new InvalidDataException("No header row present.");
 
             var origHeaders = csv.HeaderRecord ?? Array.Empty<string>();
             var indexMap = BuildHeaderMap(origHeaders);
 
-            // 4) Stream rows → DataTable → SqlBulkCopy
+            // Compute once per file
+            var reportDate = GetReportDateFromPath(path);
+            var sourceFileName = Path.GetFileName(path);
+
             long rows = 0;
+
             while (csv.Read())
             {
                 var row = table.NewRow();
 
+                // Fill canonical fields
                 foreach (var col in Canonical)
                 {
                     if (col.Equals("COMPANY_IDENTIFIER", StringComparison.OrdinalIgnoreCase))
@@ -158,13 +162,17 @@ namespace ChewyEligibilityArchiver
                     }
                     else
                     {
-                        // Old files missing BUSINESS UNIT → NULL
-                        row[col] = DBNull.Value;
+                        row[col] = DBNull.Value; // e.g., BUSINESS UNIT on old files
                     }
                 }
 
-                row["SourceFile"] = Path.GetFileName(path);
+                // Set per-row metadata
+                row["ReportDate"] = reportDate.HasValue ? reportDate.Value : (object)DBNull.Value;
+                row["SourceFile"] = sourceFileName;
+
+                // *** THIS WAS MISSING ***
                 table.Rows.Add(row);
+
                 rows++;
 
                 if (table.Rows.Count >= BatchSize)
@@ -183,12 +191,41 @@ namespace ChewyEligibilityArchiver
             return rows;
         }
 
+
         static (string Delimiter, string Header) DetectDelimiterAndHeader(string path, Encoding enc)
         {
             using var sr = new StreamReader(path, enc, true);
             var first = sr.ReadLine() ?? string.Empty;
             var delimiter = first.Contains('\t') ? "\t" : ",";
             return (delimiter, first);
+        }
+        static DateTime? GetReportDateFromPath(string path)
+        {
+            // Look for 8 consecutive digits near the end: yyyyMMdd
+            // Examples: ChewyWIN_20230403.csv, TEST_ChewyWIN_20240828.txt, ChewyWIN_20250811_v2.csv
+            var file = Path.GetFileName(path);
+            var span = file.AsSpan();
+
+            // Walk backwards to find the last 8-digit run
+            for (int i = span.Length - 1; i >= 7; i--)
+            {
+                // quick check for 8 digits ending at i (exclusive of extension)
+                if (!char.IsDigit(span[i - 0]) ||
+                    !char.IsDigit(span[i - 1]) ||
+                    !char.IsDigit(span[i - 2]) ||
+                    !char.IsDigit(span[i - 3]) ||
+                    !char.IsDigit(span[i - 4]) ||
+                    !char.IsDigit(span[i - 5]) ||
+                    !char.IsDigit(span[i - 6]) ||
+                    !char.IsDigit(span[i - 7]))
+                    continue;
+
+                var slice = span.Slice(i - 7, 8);
+                if (DateTime.TryParseExact(slice, "yyyyMMdd", System.Globalization.CultureInfo.InvariantCulture,
+                                           System.Globalization.DateTimeStyles.None, out var dt))
+                    return dt;
+            }
+            return null; // couldn’t parse
         }
 
         static Encoding DetectEncoding(string path)
@@ -210,9 +247,11 @@ namespace ChewyEligibilityArchiver
         {
             var dt = new DataTable();
             foreach (var c in Canonical) dt.Columns.Add(c, typeof(string));
+            dt.Columns.Add("ReportDate", typeof(DateTime));  // <-- NEW
             dt.Columns.Add("SourceFile", typeof(string));
             return dt;
         }
+
 
         static Dictionary<string, int> BuildHeaderMap(string[] headersRaw)
         {
